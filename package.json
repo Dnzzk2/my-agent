@@ -1,0 +1,24 @@
+{
+	"name": "AI",
+	"version": "1.0.0",
+	"description": "",
+	"type": "module",
+	"main": "index.js",
+	"scripts": {
+		"test": "echo \"Error: no test specified\" && exit 1",
+		"dev": "tsx watch agent.ts",
+		"start": "tsx agent.ts"
+	},
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"packageManager": "pnpm@10.6.5",
+	"devDependencies": {
+		"@biomejs/biome": "^2.4.8",
+		"@types/node": "^25.5.0",
+		"dotenv": "^17.3.1",
+		"openai": "^6.32.0",
+		"tsx": "^4.21.0",
+		"typescript": "^5.9.3"
+	}
+}
