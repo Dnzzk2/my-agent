@@ -1,21 +1,23 @@
 /*
-+--------+      +-------+      +---------+
-|  User  | ---> |  LLM  | ---> | Tools   |
-| prompt |      |       |      | + todo  |
-+--------+      +---+---+      +----+----+
-                    ^                |
-                    |   tool_result  |
-                    +----------------+
-                          |
-              +-----------+-----------+
-              | TodoManager state     |
-              | [ ] task A            |
-              | [>] task B  <- doing  |
-              | [x] task C            |
-              +-----------------------+
-                          |
-              if rounds_since_todo >= 3:
-                inject <reminder> into tool_result
+
+生成一个拥有独立 messages=[] 的子智能体。子智能体在其自身的上下文中工作，
+共享文件系统，完成后仅向父智能体返回任务摘要。
+
+    父智能体 (Parent)                  子智能体 (Subagent)
+    +------------------+             +------------------+
+    | messages=[...]   |             | messages=[]      |  <-- 全新上下文
+    |                  |    派发     |                  |
+    | 工具: task        | ---------->| while 工具调用:    |
+    |   提示词="..."    |            |   执行工具动作     |
+    |   描述=""        |            |   追加执行结果     |
+    |                  |    摘要     |                  |
+    |   结果 = "..."    | <--------- | 返回最终文本总结   |
+    +------------------+             +------------------+
+              |
+    父级上下文保持整洁。
+    子级上下文随后丢弃。
+
+核心见解：“进程隔离免费带来了上下文隔离。”
 
 */
 
@@ -26,9 +28,12 @@ import * as fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 
+// 全局配置：WORKDIR 为当前执行路径
 const WORKDIR = process.cwd();
 const MODEL = "deepseek-chat";
+// 父级系统提示词：鼓励使用 task 工具进行分工
 const SYSTEM = `You are a coding agent at ${WORKDIR}. Use the task tool to delegate exploration or subtasks.`;
+// 子级系统提示词：要求完成任务并总结
 const SUBAGENT_SYSTEM = `You are a coding subagent at ${WORKDIR}. Complete the given task, then summarize your findings.`;
 
 const openai = new OpenAI({
@@ -36,56 +41,9 @@ const openai = new OpenAI({
 	apiKey: process.env.DEEPSEEK_API_KEY,
 });
 
-class TodoManager {
-	items: { id: string; text: string; status: string }[] = [];
-	update(newItems: any[]): string {
-		if (newItems.length > 20) throw new Error("Max 20 todos allowed");
-
-		let inProgressCount = 0;
-		const validated = [];
-
-		for (let i = 0; i < newItems.length; i++) {
-			const item = newItems[i];
-			const text = String(item.text || "").trim();
-			const status = String(item.status || "pending").toLowerCase();
-			const id = String(item.id || String(i + 1));
-
-			if (!text) throw new Error(`Todo ${id} : must have text`);
-			if (!["pending", "in_progress", "completed"].includes(status))
-				throw new Error(`Todo ${id} : invalid status ${status}`);
-
-			if (status === "in_progress") inProgressCount++;
-
-			validated.push({ id, text, status });
-		}
-
-		if (inProgressCount > 1)
-			throw new Error("Only one todo can be in_progress at a time");
-		this.items = validated;
-		return this.render();
-	}
-
-	render(): string {
-		if (this.items.length === 0) return "No todo items.";
-
-		const lines = this.items.map((item) => {
-			const marker = { pending: "[ ]", in_progress: "[>]", completed: "[x]" }[
-				item.status
-			];
-			return `${marker} #${item.id}: ${item.text}`;
-		});
-
-		const done = this.items.filter((t) => t.status === "completed").length;
-
-		lines.push(`\n(Progress: ${done}/${this.items.length} completed)`);
-		return lines.join("\n");
-	}
-}
-
-const TODO = new TodoManager();
-
-// -- Tool implementations shared by parent and child --
-
+/**
+ * 安全路径：限制文件操作仅能在当前工作区内进行
+ */
 function safePath(p: string): string {
 	const resolvedPath = path.resolve(WORKDIR, p);
 	if (!resolvedPath.startsWith(WORKDIR)) {
@@ -94,29 +52,29 @@ function safePath(p: string): string {
 	return resolvedPath;
 }
 
+/**
+ * 执行系统命令工具
+ */
 function runPwsh(command: string): string {
 	const dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
 	if (dangerous.some((d) => command.includes(d))) {
-		return "Error: Dangerous command blocked";
+		return "Error: 危险命令已被拒绝";
 	}
 
 	try {
-		// 使用 execSync 模拟同步执行
 		const output = execSync(command, {
 			cwd: WORKDIR,
-			timeout: 120000, // 120s
+			timeout: 120000,
 			encoding: "utf-8",
-			stdio: ["pipe", "pipe", "pipe"], // 捕获 stdout 和 stderr
+			stdio: ["pipe", "pipe", "pipe"],
 			shell: "pwsh.exe",
 		});
-		return output.trim() || "(no output)";
+		return output.trim() || "(无输出)";
 	} catch (error: any) {
 		if (error.code === "ETIMEDOUT") {
-			return "Error: Timeout (120s)";
+			return "Error: 执行超时 (120s)";
 		}
-		// 合并 stdout 和 stderr
-		const out =
-			(error.stdout?.toString() || "") + (error.stderr?.toString() || "");
+		const out = (error.stdout?.toString() || "") + (error.stderr?.toString() || "");
 		return out.trim().slice(0, 50000) || `Error: ${error.message}`;
 	}
 }
@@ -126,19 +84,18 @@ function runRead(filePath: string): string {
 		const sp = safePath(filePath);
 		return fs.readFileSync(sp, "utf-8");
 	} catch (err: any) {
-		return `Read error: ${err.message}`;
+		return `读取错误: ${err.message}`;
 	}
 }
 
 function runWrite(filePath: string, content: string): string {
 	try {
 		const sp = safePath(filePath);
-		// 如果文件夹不存在，自动创建
 		fs.mkdirSync(path.dirname(sp), { recursive: true });
 		fs.writeFileSync(sp, content, "utf-8");
-		return `Write success, ${content.length} characters written to ${filePath}`;
+		return `写入成功，长度: ${content.length}`;
 	} catch (err: any) {
-		return `Write error: ${err.message}`;
+		return `写入错误: ${err.message}`;
 	}
 }
 
@@ -147,30 +104,30 @@ function runEdit(filePath: string, oldText: string, newText: string): string {
 		const sp = safePath(filePath);
 		let content = fs.readFileSync(sp, "utf-8");
 		if (!content.includes(oldText))
-			return `Error: Cannot find text to replace "${oldText}"`;
-		// 替换文本并重新写入
+			return `错误：找不到旧文本 "${oldText}"`;
 		content = content.replace(oldText, newText);
 		fs.writeFileSync(sp, content, "utf-8");
-		return `Edit success: ${filePath}`;
+		return `编辑成功: ${filePath}`;
 	} catch (err: any) {
-		return `Edit error: ${err.message}`;
+		return `编辑错误: ${err.message}`;
 	}
 }
 
+// 通用的工具处理器映射
 const TOOLS_HANDLERS: Record<string, (...args: any[]) => any> = {
 	powershell: (args: any) => runPwsh(args.command),
 	read_file: (args: any) => runRead(args.filePath),
 	write_file: (args: any) => runWrite(args.filePath, args.content),
 	edit_file: (args: any) => runEdit(args.filePath, args.oldText, args.newText),
-	todo: (args: any) => TODO.update(args.items),
 };
 
+// 子智能体可用的工具定义（不包含 task，防止无限套娃）
 const CHILD_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 	{
 		type: "function",
 		function: {
 			name: "powershell",
-			description: "Run a powershell command.",
+			description: "运行 PowerShell 命令。",
 			parameters: {
 				type: "object",
 				properties: { command: { type: "string" } },
@@ -182,7 +139,7 @@ const CHILD_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 		type: "function",
 		function: {
 			name: "read_file",
-			description: "Read a file.",
+			description: "读取一个文件。",
 			parameters: {
 				type: "object",
 				properties: { filePath: { type: "string" } },
@@ -194,7 +151,7 @@ const CHILD_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 		type: "function",
 		function: {
 			name: "write_file",
-			description: "Write a file.",
+			description: "写入文件内容。",
 			parameters: {
 				type: "object",
 				properties: {
@@ -209,7 +166,7 @@ const CHILD_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 		type: "function",
 		function: {
 			name: "edit_file",
-			description: "Edit a file.",
+			description: "编辑现有文件。",
 			parameters: {
 				type: "object",
 				properties: {
@@ -221,49 +178,22 @@ const CHILD_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 			},
 		},
 	},
-	// {
-	// 	type: "function",
-	// 	function: {
-	// 		name: "todo",
-	// 		description: "Update task list. Track progress on multi-step tasks.",
-	// 		parameters: {
-	// 			type: "object",
-	// 			properties: {
-	// 				items: {
-	// 					type: "array",
-	// 					items: {
-	// 						type: "object",
-	// 						properties: {
-	// 							id: { type: "string" },
-	// 							text: { type: "string" },
-	// 							status: {
-	// 								type: "string",
-	// 								enum: ["pending", "in_progress", "completed"],
-	// 							},
-	// 						},
-	// 						required: ["id", "text", "status"],
-	// 					},
-	// 				},
-	// 			},
-	// 			required: ["items"],
-	// 		},
-	// 	},
-	// },
 ];
 
-//  -- Subagent: fresh context, filtered tools, summary-only return --
-
+/**
+ * 运行子智能体逻辑：
+ * 拥有全新的消息队列，独立于父级的对话历史。
+ */
 async function runSubagent(prompt: string): Promise<string> {
+	// 子智能体的初始状态：仅包含系统提示词和分配的任务
 	const sub_messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-		{
-			role: "system",
-			content: SUBAGENT_SYSTEM,
-		},
+		{ role: "system", content: SUBAGENT_SYSTEM },
 		{ role: "user", content: prompt },
 	];
 
 	let lastMessage: OpenAI.Chat.ChatCompletionMessage | null = null;
 
+	// 限制子智能体对话次数（此处最大 30 次）以防死循环
 	for (let i = 0; i < 30; i++) {
 		const response = await openai.chat.completions.create({
 			model: MODEL,
@@ -275,26 +205,26 @@ async function runSubagent(prompt: string): Promise<string> {
 		lastMessage = response.choices[0].message;
 		sub_messages.push(lastMessage);
 
-		if (
-			response.choices[0].finish_reason !== "tool_calls" ||
-			!lastMessage.tool_calls
-		) {
+		// 如果不再需要工具调用，表示任务完成
+		if (response.choices[0].finish_reason !== "tool_calls" || !lastMessage.tool_calls) {
 			break;
 		}
 
+		// 处理子智能体的工具请求
 		for (const toolCall of lastMessage.tool_calls) {
 			if (toolCall.type === "function") {
 				const toolName = toolCall.function.name;
 				const args = JSON.parse(toolCall.function.arguments);
 				const handler = TOOLS_HANDLERS[toolName];
 				if (!handler) {
-					console.log(`Error: Unknown tool ${toolName}`);
+					console.log(`Error: 找不到工具 ${toolName}`);
 					continue;
 				}
 				const result = handler(args);
-				console.log(
-					`\x1b[33m[子智能体调用工具]\x1b[0m -> ${toolName}: ${result.slice(0, 200)}...`,
-				);
+				
+				// 打印子级工作日志
+				console.log(`\x1b[33m[子智能体调用工具]\x1b[0m -> ${toolName}: ${result.slice(0, 200)}...`);
+
 				sub_messages.push({
 					role: "tool",
 					tool_call_id: toolCall.id,
@@ -304,31 +234,31 @@ async function runSubagent(prompt: string): Promise<string> {
 		}
 	}
 
-	return lastMessage?.content || "(no summary)";
+	// 最终仅向上层返回子智能体最后给出的结果文字（即任务摘要）
+	return lastMessage?.content || "(无总结内容)";
 }
 
+// 父智能体的工具列表：包含基础工具及 task (生成子任务)
 const PARENT_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 	...CHILD_TOOLS,
 	{
 		type: "function",
 		function: {
 			name: "task",
-			description:
-				"Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+			description: "生成一个子智能体并进入独立的运行上下文，主进程在此期间会等待子进程反馈。",
 			parameters: {
 				type: "object",
-				properties: {
-					prompt: { type: "string" },
-				},
+				properties: { prompt: { type: "string" } },
 				required: ["prompt"],
 			},
 		},
 	},
 ];
 
+/**
+ * 主循环逻辑
+ */
 async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
-	// let rounds_since_todo = 0;
-
 	while (true) {
 		const response = await openai.chat.completions.create({
 			model: MODEL,
@@ -338,43 +268,35 @@ async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
 		});
 
 		const message = response.choices[0].message;
-
-		// 将助理的回复（可能包含 tool_calls）存入历史
 		messages.push(message);
 
-		// 如果没有工具调用，结束循环
-		if (
-			response.choices[0].finish_reason !== "tool_calls" ||
-			!message.tool_calls
-		) {
+		// 结束对话
+		if (response.choices[0].finish_reason !== "tool_calls" || !message.tool_calls) {
 			return;
 		}
 
-		// let usedTodoThisRound = false;
-
-		// 处理每一个工具调用
 		for (const toolCall of message.tool_calls) {
 			if (toolCall.type === "function") {
 				const toolName = toolCall.function.name;
 				const args = JSON.parse(toolCall.function.arguments);
 				let result = "";
 
-				// if (toolName === "todo") usedTodoThisRound = true;
+				// 判读是否为特殊工具：生成子代理
 				if (toolName === "task") {
 					result = await runSubagent(args.prompt);
 				} else {
 					const handler = TOOLS_HANDLERS[toolName];
 					if (!handler) {
-						console.log(`Error: Unknown tool ${toolName}`);
+						console.log(`Error: 找不到工具 ${toolName}`);
 						continue;
 					}
 					result = handler(args);
-					console.log(
-						`\x1b[32m[父智能体调用工具]\x1b[0m -> ${toolName}: ${result.slice(0, 200)}...`,
-					);
+					
+					// 打印父级工作日志
+					console.log(`\x1b[32m[父智能体调用工具]\x1b[0m -> ${toolName}: ${result.slice(0, 200)}...`);
 				}
 
-				// OpenAI 要求将结果作为 role: "tool" 反馈
+				// 将（子级产生的摘要或常规工具执行结果）反馈回全局上下文
 				messages.push({
 					role: "tool",
 					tool_call_id: toolCall.id,
@@ -382,28 +304,11 @@ async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
 				});
 			}
 		}
-
-		// if (usedTodoThisRound) {
-		// 	rounds_since_todo = 0;
-		// 	console.log(`\x1b[34m[Todo List]\n${TODO.render()}\x1b[0m`);
-		// } else {
-		// 	rounds_since_todo++;
-		// }
-		// if (rounds_since_todo > 3) {
-		// 	console.log(
-		// 		`\x1b[31m[系统监工] 大模型已连续 3 轮未更新状态，强制提醒！\x1b[0m`,
-		// 	);
-		// 	messages.push({
-		// 		role: "user",
-		// 		content: "<reminder>Update your todos.</reminder>",
-		// 	});
-		// 	rounds_since_todo = 0;
-		// }
 	}
 }
 
 /**
- * CLI 交互主程序
+ * 入口函数
  */
 async function main() {
 	const rl = readline.createInterface({
@@ -411,8 +316,7 @@ async function main() {
 		output: process.stdout,
 	});
 
-	const ask = (query: string) =>
-		new Promise<string>((resolve) => rl.question(query, resolve));
+	const ask = (query: string) => new Promise<string>((resolve) => rl.question(query, resolve));
 	const history: OpenAI.Chat.ChatCompletionMessageParam[] = [];
 
 	while (true) {
@@ -426,7 +330,6 @@ async function main() {
 		history.push({ role: "user", content: query });
 		await agentLoop(history);
 
-		// 打印最后一条非工具调用的文本回复
 		const lastMsg = history[history.length - 1];
 		if (lastMsg.role === "assistant" && lastMsg.content) {
 			console.log(`\n${lastMsg.content}`);
