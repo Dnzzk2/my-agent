@@ -44,7 +44,7 @@ const openai = new OpenAI({
  * 任务管理器：负责维护 Todo 列表的状态
  */
 class TodoManager {
-	items: { id: string; text: string; status: string }[] = [];
+	private items: { id: string; text: string; status: string }[] = [];
 
 	// 更新任务列表
 	update(newItems: any[]): string {
@@ -128,7 +128,8 @@ function runPwsh(command: string): string {
 		if (error.code === "ETIMEDOUT") {
 			return "Error: 执行超时 (120s)";
 		}
-		const out = (error.stdout?.toString() || "") + (error.stderr?.toString() || "");
+		const out =
+			(error.stdout?.toString() || "") + (error.stderr?.toString() || "");
 		return out.trim().slice(0, 50000) || `Error: ${error.message}`;
 	}
 }
@@ -289,7 +290,10 @@ async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
 		const message = response.choices[0].message;
 		messages.push(message);
 
-		if (response.choices[0].finish_reason !== "tool_calls" || !message.tool_calls) {
+		if (
+			response.choices[0].finish_reason !== "tool_calls" ||
+			!message.tool_calls
+		) {
 			return;
 		}
 
@@ -311,7 +315,9 @@ async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
 				const result = handler(args);
 
 				// 打印日志：保留缩进且截取关键内容显示
-				console.log(`\x1b[32m[智能体调用工具]\x1b[0m -> ${toolName}: ${result.slice(0, 200)}...`);
+				console.log(
+					`\x1b[32m[智能体调用工具]\x1b[0m -> ${toolName}: ${result.slice(0, 200)}...`,
+				);
 
 				messages.push({
 					role: "tool",
@@ -331,7 +337,9 @@ async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
 
 		// 如果大模型连续 3 轮都没通过 todo 更新状态，强制插入提醒
 		if (rounds_since_todo > 3) {
-			console.log(`\x1b[31m[系统监工] 大模型已连续 3 轮未更新状态，强制提醒更新 Todo！\x1b[0m`);
+			console.log(
+				`\x1b[31m[系统监工] 大模型已连续 3 轮未更新状态，强制提醒更新 Todo！\x1b[0m`,
+			);
 			messages.push({
 				role: "user",
 				content: "<reminder>请更新你的 todo 列表以同步任务进度。</reminder>",
@@ -350,7 +358,8 @@ async function main() {
 		output: process.stdout,
 	});
 
-	const ask = (query: string) => new Promise<string>((resolve) => rl.question(query, resolve));
+	const ask = (query: string) =>
+		new Promise<string>((resolve) => rl.question(query, resolve));
 	const history: OpenAI.Chat.ChatCompletionMessageParam[] = [];
 
 	while (true) {

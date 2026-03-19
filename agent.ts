@@ -37,7 +37,7 @@ const openai = new OpenAI({
 });
 
 class TodoManager {
-	items: { id: string; text: string; status: string }[] = [];
+	private items: { id: string; text: string; status: string }[] = [];
 	update(newItems: any[]): string {
 		if (newItems.length > 20) throw new Error("Max 20 todos allowed");
 
@@ -221,34 +221,34 @@ const CHILD_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 			},
 		},
 	},
-	// {
-	// 	type: "function",
-	// 	function: {
-	// 		name: "todo",
-	// 		description: "Update task list. Track progress on multi-step tasks.",
-	// 		parameters: {
-	// 			type: "object",
-	// 			properties: {
-	// 				items: {
-	// 					type: "array",
-	// 					items: {
-	// 						type: "object",
-	// 						properties: {
-	// 							id: { type: "string" },
-	// 							text: { type: "string" },
-	// 							status: {
-	// 								type: "string",
-	// 								enum: ["pending", "in_progress", "completed"],
-	// 							},
-	// 						},
-	// 						required: ["id", "text", "status"],
-	// 					},
-	// 				},
-	// 			},
-	// 			required: ["items"],
-	// 		},
-	// 	},
-	// },
+	{
+		type: "function",
+		function: {
+			name: "todo",
+			description: "Update task list. Track progress on multi-step tasks.",
+			parameters: {
+				type: "object",
+				properties: {
+					items: {
+						type: "array",
+						items: {
+							type: "object",
+							properties: {
+								id: { type: "string" },
+								text: { type: "string" },
+								status: {
+									type: "string",
+									enum: ["pending", "in_progress", "completed"],
+								},
+							},
+							required: ["id", "text", "status"],
+						},
+					},
+				},
+				required: ["items"],
+			},
+		},
+	},
 ];
 
 //  -- Subagent: fresh context, filtered tools, summary-only return --
@@ -327,7 +327,7 @@ const PARENT_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 ];
 
 async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
-	// let rounds_since_todo = 0;
+	let rounds_since_todo = 0;
 
 	while (true) {
 		const response = await openai.chat.completions.create({
@@ -350,7 +350,7 @@ async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
 			return;
 		}
 
-		// let usedTodoThisRound = false;
+		let usedTodoThisRound = false;
 
 		// 处理每一个工具调用
 		for (const toolCall of message.tool_calls) {
@@ -359,7 +359,7 @@ async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
 				const args = JSON.parse(toolCall.function.arguments);
 				let result = "";
 
-				// if (toolName === "todo") usedTodoThisRound = true;
+				if (toolName === "todo") usedTodoThisRound = true;
 				if (toolName === "task") {
 					result = await runSubagent(args.prompt);
 				} else {
@@ -383,22 +383,22 @@ async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
 			}
 		}
 
-		// if (usedTodoThisRound) {
-		// 	rounds_since_todo = 0;
-		// 	console.log(`\x1b[34m[Todo List]\n${TODO.render()}\x1b[0m`);
-		// } else {
-		// 	rounds_since_todo++;
-		// }
-		// if (rounds_since_todo > 3) {
-		// 	console.log(
-		// 		`\x1b[31m[系统监工] 大模型已连续 3 轮未更新状态，强制提醒！\x1b[0m`,
-		// 	);
-		// 	messages.push({
-		// 		role: "user",
-		// 		content: "<reminder>Update your todos.</reminder>",
-		// 	});
-		// 	rounds_since_todo = 0;
-		// }
+		if (usedTodoThisRound) {
+			rounds_since_todo = 0;
+			console.log(`\x1b[34m[Todo List]\n${TODO.render()}\x1b[0m`);
+		} else {
+			rounds_since_todo++;
+		}
+		if (rounds_since_todo > 3) {
+			console.log(
+				`\x1b[31m[系统监工] 大模型已连续 3 轮未更新状态，强制提醒！\x1b[0m`,
+			);
+			messages.push({
+				role: "user",
+				content: "<reminder>Update your todos.</reminder>",
+			});
+			rounds_since_todo = 0;
+		}
 	}
 }
 
