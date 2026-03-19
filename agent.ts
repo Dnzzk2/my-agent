@@ -1,42 +1,39 @@
 /*
-    +----------+      +-------+      +---------+
-    |   User   | ---> |  LLM  | ---> |  Tool   |
-    |  prompt  |      |       |      | execute |
-    +----------+      +---+---+      +----+----+
-                          ^               |
-                          |   tool_result |
-                          +---------------+
-                         (loop continues)
+    +----------+      +-------+      +------------------+
+    |   User   | ---> |  LLM  | ---> | Tool Dispatch    |
+    |  prompt  |      |       |      | {                |
+    +----------+      +---+---+      |   bash: run_bash |
+                          ^          |   read: run_read |
+                          |          |   write: run_wr  |
+                          +----------+   edit: run_edit |
+                          tool_result| }                |
+                                     +------------------+
 
 */
 
+import { execSync } from "node:child_process";
 import OpenAI from "openai";
-import { execSync } from "child_process";
 import "dotenv/config";
-import readline from "readline";
+import * as fs from "node:fs";
+import path from "node:path";
+import readline from "node:readline";
+
+const WORKDIR = process.cwd();
+const MODEL = "deepseek-chat";
+const SYSTEM = `You are a coding agent at ${WORKDIR}. Use bash to solve tasks. Act, don't explain.`;
 
 const openai = new OpenAI({
 	baseURL: process.env.DEEPSEEK_BASE_URL,
 	apiKey: process.env.DEEPSEEK_API_KEY,
 });
 
-const MODEL = "deepseek-chat";
-const SYSTEM = `You are a coding agent at ${process.cwd()}. Use bash to solve tasks. Act, don't explain.`;
-
-const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
-	{
-		type: "function",
-		function: {
-			name: "powershell",
-			description: "Run a powershell command.",
-			parameters: {
-				type: "object",
-				properties: { command: { type: "string" } },
-				required: ["command"],
-			},
-		},
-	},
-];
+function safePath(p: string): string {
+	const resolvedPath = path.resolve(WORKDIR, p);
+	if (!resolvedPath.startsWith(WORKDIR)) {
+		throw new Error(`安全拦截：禁止访问工作区之外的路径 -> ${p}`);
+	}
+	return resolvedPath;
+}
 
 function runPwsh(command: string): string {
 	const dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
@@ -47,7 +44,7 @@ function runPwsh(command: string): string {
 	try {
 		// 使用 execSync 模拟同步执行
 		const output = execSync(command, {
-			cwd: process.cwd(),
+			cwd: WORKDIR,
 			timeout: 120000, // 120s
 			encoding: "utf-8",
 			stdio: ["pipe", "pipe", "pipe"], // 捕获 stdout 和 stderr
@@ -64,6 +61,107 @@ function runPwsh(command: string): string {
 		return out.trim().slice(0, 50000) || `Error: ${error.message}`;
 	}
 }
+
+function runRead(filePath: string): string {
+	try {
+		const sp = safePath(filePath);
+		return fs.readFileSync(sp, "utf-8");
+	} catch (err: any) {
+		return `Read error: ${err.message}`;
+	}
+}
+
+function runWrite(filePath: string, content: string): string {
+	try {
+		const sp = safePath(filePath);
+		// 如果文件夹不存在，自动创建
+		fs.mkdirSync(path.dirname(sp), { recursive: true });
+		fs.writeFileSync(sp, content, "utf-8");
+		return `Write success, ${content.length} characters written to ${filePath}`;
+	} catch (err: any) {
+		return `Write error: ${err.message}`;
+	}
+}
+
+function runEdit(filePath: string, oldText: string, newText: string): string {
+	try {
+		const sp = safePath(filePath);
+		let content = fs.readFileSync(sp, "utf-8");
+		if (!content.includes(oldText))
+			return `Error: Cannot find text to replace "${oldText}"`;
+		// 替换文本并重新写入
+		content = content.replace(oldText, newText);
+		fs.writeFileSync(sp, content, "utf-8");
+		return `Edit success: ${filePath}`;
+	} catch (err: any) {
+		return `Edit error: ${err.message}`;
+	}
+}
+
+const TOOLS_HANDLERS: Record<string, Function> = {
+	powershell: (args: any) => runPwsh(args.command),
+	read_file: (args: any) => runRead(args.filePath),
+	write_file: (args: any) => runWrite(args.filePath, args.content),
+	edit_file: (args: any) => runEdit(args.filePath, args.oldText, args.newText),
+};
+
+const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
+	{
+		type: "function",
+		function: {
+			name: "powershell",
+			description: "Run a powershell command.",
+			parameters: {
+				type: "object",
+				properties: { command: { type: "string" } },
+				required: ["command"],
+			},
+		},
+	},
+	{
+		type: "function",
+		function: {
+			name: "read_file",
+			description: "Read a file.",
+			parameters: {
+				type: "object",
+				properties: { filePath: { type: "string" } },
+				required: ["filePath"],
+			},
+		},
+	},
+	{
+		type: "function",
+		function: {
+			name: "write_file",
+			description: "Write a file.",
+			parameters: {
+				type: "object",
+				properties: {
+					filePath: { type: "string" },
+					content: { type: "string" },
+				},
+				required: ["filePath", "content"],
+			},
+		},
+	},
+	{
+		type: "function",
+		function: {
+			name: "edit_file",
+			description: "Edit a file.",
+			parameters: {
+				type: "object",
+				properties: {
+					filePath: { type: "string" },
+					oldText: { type: "string" },
+					newText: { type: "string" },
+				},
+				required: ["filePath", "oldText", "newText"],
+			},
+		},
+	},
+];
 
 async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
 	while (true) {
@@ -89,16 +187,19 @@ async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
 
 		// 处理每一个工具调用
 		for (const toolCall of message.tool_calls) {
-			if (
-				toolCall.type === "function" &&
-				toolCall.function.name === "powershell"
-			) {
+			if (toolCall.type === "function") {
+				const toolName = toolCall.function.name;
 				const args = JSON.parse(toolCall.function.arguments);
-				const command = args.command;
 
-				console.log(`\x1b[33m$ ${command}\x1b[0m`);
-				const output = runPwsh(command);
-				console.log(output.slice(0, 200));
+				const handler = TOOLS_HANDLERS[toolName];
+				if (!handler) {
+					console.log(`Error: Unknown tool ${toolName}`);
+					continue;
+				}
+				const output = handler(args);
+				console.log(
+					`\x1b[33m[调用工具]\x1b[0m -> ${toolName}: ${output.slice(0, 200).replace(/\n/g, " ")}...`,
+				);
 
 				// OpenAI 要求将结果作为 role: "tool" 反馈
 				messages.push({
@@ -125,7 +226,7 @@ async function main() {
 	const history: OpenAI.Chat.ChatCompletionMessageParam[] = [];
 
 	while (true) {
-		const query = await ask("\x1b[36ms01 >> \x1b[0m");
+		const query = await ask("\x1b[36mMy-agent >> \x1b[0m");
 
 		if (!query || ["q", "exit"].includes(query.toLowerCase().trim())) {
 			rl.close();
