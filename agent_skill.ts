@@ -1,28 +1,3 @@
-/*
-模型通过 TodoManager 追踪自身进度。
-当模型忘记更新状态时，系统会通过强制提醒（Nag Reminder）来促使其更新。
-
-    +----------+      +-------+      +---------+
-    |   用户   | ---> |  LLM  | ---> | 工具     |
-    |   提示词 |      |       |      | + todo  |
-    +----------+      +---+---+      +----+----+
-                          ^               |
-                          |   工具执行结果 |
-                          +---------------+
-                                |
-                    +-----------+-----------+
-                    | TodoManager 状态      |
-                    | [ ] 任务 A            |
-                    | [>] 任务 B <- 执行中  |
-                    | [x] 任务 C            |
-                    +-----------------------+
-                                |
-                    如果 连续 3 轮未更新:
-                      注入 <reminder> 强制提醒
-
-核心见解：“智能体可以追踪规划自身进度，且主进程全局可见。”
-*/
-
 import { execSync } from "node:child_process";
 import OpenAI from "openai";
 import "dotenv/config";
@@ -51,12 +26,37 @@ class SkillLoader {
 		this.loadAll();
 	}
 
+	private findSkillFiles(dir: string): string[] {
+		const entries = fs.readdirSync(dir, { withFileTypes: true });
+		const files: string[] = [];
+
+		for (const entry of entries) {
+			const fullPath = path.join(dir, entry.name);
+
+			if (entry.isDirectory()) {
+				files.push(...this.findSkillFiles(fullPath));
+				continue;
+			}
+
+			if (entry.isFile() && entry.name.endsWith(".md")) {
+				files.push(fullPath);
+			}
+		}
+
+		return files;
+	}
+
 	// 扫描 skills 文件夹下所有的 .md 文件
 	loadAll() {
 		if (!fs.existsSync(SKILLS_DIR)) return;
-		const files = fs.readdirSync(SKILLS_DIR).filter((f) => f.endsWith(".md"));
-		for (const file of files) {
-			const content = fs.readFileSync(path.join(SKILLS_DIR, file), "utf-8");
+		const files = this.findSkillFiles(SKILLS_DIR);
+		for (const filePath of files) {
+			const content = fs.readFileSync(filePath, "utf-8");
+			const fileName = path.basename(filePath);
+			const defaultName =
+				fileName.toUpperCase() === "SKILL.MD"
+					? path.basename(path.dirname(filePath))
+					: path.basename(filePath, ".md");
 
 			// 简单解析 YAML frontmatter (由 --- 包围的部分)
 			const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)/);
@@ -64,7 +64,7 @@ class SkillLoader {
 				const metaBlock = match[1];
 				const body = match[2].trim();
 
-				let name = file.replace(".md", "");
+				let name = defaultName;
 				let desc = "无描述";
 
 				metaBlock.split("\n").forEach((line) => {
@@ -261,6 +261,8 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 	},
 ];
 
+console.log(skillLoader.getDescriptions());
+
 const SYSTEM = `You are a coding agent at ${WORKDIR}.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 Skills available:
@@ -280,6 +282,8 @@ async function agentLoop(messages: OpenAI.Chat.ChatCompletionMessageParam[]) {
 
 		const message = response.choices[0].message;
 		messages.push(message);
+
+		console.log(message);
 
 		if (
 			response.choices[0].finish_reason !== "tool_calls" ||
