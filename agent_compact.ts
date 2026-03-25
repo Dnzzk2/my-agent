@@ -11,7 +11,7 @@ dotenv.config({ override: true });
 const WORKDIR = process.cwd();
 const MODEL = getRequiredEnv("MODEL_ID");
 const SYSTEM = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks.`;
-const THRESHOLD = 50000;
+const THRESHOLD = 6000;
 const TRANSCRIPT_DIR = path.join(WORKDIR, ".transcripts");
 const KEEP_RECENT = 3;
 const TOOL_OUTPUT_LIMIT = 50000;
@@ -89,6 +89,10 @@ type CompletionResult = {
 	message: AssistantMessage;
 	finish_reason: string | null;
 };
+
+function getToolCalls(message: AssistantMessage): AssistantToolCall[] {
+	return message.tool_calls ?? [];
+}
 
 const TOOLS: ToolDefinition[] = [
 	{
@@ -443,6 +447,39 @@ function toOpenAIMessages(
 	return openaiMessages;
 }
 
+function assertToolCallResponses(messages: ConversationMessage[]): void {
+	for (let index = 0; index < messages.length; index += 1) {
+		const message = messages[index];
+		if (message.role !== "assistant") {
+			continue;
+		}
+
+		const toolCalls = getToolCalls(message);
+		if (toolCalls.length === 0) {
+			continue;
+		}
+
+		const pendingIds = new Set(toolCalls.map((toolCall) => toolCall.id));
+		let cursor = index + 1;
+
+		while (cursor < messages.length && pendingIds.size > 0) {
+			const nextMessage = messages[cursor];
+			if (nextMessage.role !== "tool") {
+				break;
+			}
+
+			pendingIds.delete(nextMessage.tool_call_id);
+			cursor += 1;
+		}
+
+		if (pendingIds.size > 0) {
+			throw new Error(
+				`Invalid conversation history: missing tool responses for ${Array.from(pendingIds).join(", ")}`,
+			);
+		}
+	}
+}
+
 // 把 OpenAI SDK 返回的 assistant message 收敛回我们的内部结构。
 // 这样后面的 compact、日志、主循环都只处理一种统一格式，
 // 不需要每个地方都直接耦合 SDK 的原始返回类型。
@@ -496,6 +533,8 @@ async function createCompletion(body: {
 	system?: string;
 	tools?: ToolDefinition[];
 }): Promise<CompletionResult> {
+	assertToolCallResponses(body.messages);
+
 	const response = await openai.chat.completions.create({
 		model: body.model,
 		messages: toOpenAIMessages(body.messages, body.system),
@@ -514,7 +553,7 @@ async function createCompletion(body: {
 // 1) 请求模型
 // 2) 执行模型要求的工具
 // 3) 把工具结果按 tool 消息追加回历史
-// 一旦模型不再返回 tool_calls，本轮就结束。
+// 一旦 assistant 消息里不再携带 tool_calls，本轮就结束。
 //
 // 可以按下面的顺序理解这个循环：
 // A. 先做 microCompact，避免每一轮都带着过长的旧工具输出
@@ -542,14 +581,15 @@ async function agentLoop(messages: ConversationMessage[]): Promise<void> {
 
 		messages.push(response.message);
 
-		if (response.finish_reason !== "tool_calls") {
+		const toolCalls = getToolCalls(response.message);
+		if (toolCalls.length === 0) {
 			return;
 		}
 
-		// 只要 finish_reason 是 tool_calls，就说明当前 assistant 消息里一定包含工具调用请求。
-		// 我们必须把这些工具逐个执行完，再把结果回传给下一轮模型。
+		// 只要当前 assistant 消息里带着 tool_calls，
+		// 我们就必须把这些工具逐个执行完，再把结果回传给下一轮模型。
 		let manualCompact = false;
-		for (const toolCall of response.message.tool_calls ?? []) {
+		for (const toolCall of toolCalls) {
 			let output = "";
 
 			if (toolCall.function.name === "compact") {
@@ -596,7 +636,16 @@ async function main(): Promise<void> {
 
 	try {
 		while (true) {
-			const query = await rl.question("\u001b[36ms06 >> \u001b[0m");
+			let query = "";
+			try {
+				query = await rl.question("\u001b[36ms06 >> \u001b[0m");
+			} catch (error) {
+				if ((error as { code?: string }).code === "ABORT_ERR") {
+					console.log();
+					break;
+				}
+				throw error;
+			}
 			const normalized = query.trim().toLowerCase();
 
 			if (normalized === "" || normalized === "q" || normalized === "exit") {
@@ -618,6 +667,10 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
+	if ((error as { code?: string }).code === "ABORT_ERR") {
+		process.exitCode = 0;
+		return;
+	}
 	console.error(error);
 	process.exitCode = 1;
 });
